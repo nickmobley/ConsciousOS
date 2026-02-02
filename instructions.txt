@@ -1,0 +1,1 @@
+Initialize the 'Conscious-Stack' directory with [workspace, memory, logs] subfolders, move my existing 'Clawbot' and 'ConsciousOS' folders into the workspace, and generate a 'manifest.json' in memory that logs this successful setup.
