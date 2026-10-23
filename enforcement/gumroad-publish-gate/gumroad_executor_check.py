@@ -12,7 +12,7 @@ mechanical boundary being tested; the write channel (API token or dedicated prof
 plugs in behind it once Nick's channel step is done.
 Usage: gumroad_executor_check.py --item X --name "<name>" --price N --package <zip>
 """
-import argparse, hashlib, json, os, pathlib, sys, time
+import argparse, hashlib, json, math, os, pathlib, sys, time
 
 BASE = pathlib.Path.home()/"workspace/operation-mobley/enforcement"
 AUDIT = BASE/"publish-audit.jsonl"; PERMITS = BASE/"permits"; CONSUMED = BASE/"consumed-permits.jsonl"
@@ -61,6 +61,8 @@ def main():
     a = ap.parse_args()
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     reasons = []
+    if not math.isfinite(a.price) or a.price <= 0:
+        reasons.append(f"DENY permit: requested price {a.price} is not a finite positive number")
     pf = PERMITS/f"{a.item.replace('/','_')}.json"
     permit = None
     if not pf.exists(): reasons.append("DENY permit: none issued for this item")
@@ -68,7 +70,8 @@ def main():
         permit = json.loads(pf.read_text())
         pkg_hash = hashlib.sha256(pathlib.Path(a.package).read_bytes()).hexdigest()
         if permit["product"] != a.name: reasons.append("DENY permit: product mismatch (tamper or wrong permit)")
-        if abs(permit["price"] - a.price) > 1e-9: reasons.append("DENY permit: price mismatch vs permit envelope")
+        if not math.isfinite(permit["price"]): reasons.append("DENY permit: permit price is not finite")
+        if math.isfinite(permit["price"]) and math.isfinite(a.price) and abs(permit["price"] - a.price) > 1e-9: reasons.append("DENY permit: price mismatch vs permit envelope")
         if permit["package_sha256"] != pkg_hash: reasons.append("DENY permit: package hash mismatch")
         if time.time() > permit["expires_epoch"]: reasons.append("DENY permit: expired")
         if not verify_chain(): reasons.append("DENY permit: audit chain verification failed (tamper or corruption)")
@@ -79,8 +82,8 @@ def main():
             consumed = {json.loads(l)["audit_hash"] for l in CONSUMED.read_text().strip().splitlines()}
         if permit["audit_hash"] in consumed: reasons.append("DENY permit: already consumed (replay)")
     decision = "DENY" if reasons else "ACCEPT"
-    entry = {"ts": now, "gate": "executor-check v1.2", "item": a.item, "product": a.name,
-             "decision": decision, "reasons": reasons or ["permit valid; consumed atomically; dry-run execution boundary passed (no platform write in v1.2)"]}
+    entry = {"ts": now, "gate": "executor-check v1.2.1", "item": a.item, "product": a.name,
+             "decision": decision, "reasons": reasons or ["permit valid; consumed atomically; dry-run execution boundary passed (no platform write in v1.2.1)"]}
     if decision == "ACCEPT":
         if not try_consume(permit["audit_hash"], a.item, now):
             decision = "DENY"

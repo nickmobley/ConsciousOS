@@ -12,13 +12,13 @@ BEFORE any write. The gate checks, in order:
   4. AUDIT: every decision (ALLOW or DENY) is appended to a hash-chained JSONL audit log
      BEFORE the result is returned. A DENY stops the workflow before any external write.
 On ALLOW the gate issues a permit file (item, product, price, package sha256, expiry 30 min).
-The executor (separate step) must present a valid permit. Gate version 1.2 (fail-closed fixes; see PR).
+The executor (separate step) must present a valid permit. Gate version 1.2.1 (fail-closed + finite-price guard; see PR).
 Honest limit: permit/audit integrity is tamper-EVIDENT (hash chain), not tamper-proof
 against an actor with full filesystem control; see the architecture doc for the route
 inventory and the remaining bypass analysis.
 Usage: gumroad_publish_gate.py --item CI-01(a) --name "<product name>" --price 24 --package <zip>
 """
-import argparse, hashlib, json, pathlib, sys, time, urllib.request
+import argparse, hashlib, json, math, pathlib, sys, time, urllib.request
 
 BASE = pathlib.Path.home()/"workspace/operation-mobley/enforcement"
 QUEUE = pathlib.Path.home()/"workspace/operation-mobley/commercial-deliverables-queue.md"
@@ -58,6 +58,9 @@ def main():
     pkg_exists = pkg.exists()
     pkg_hash = hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg_exists else "MISSING"
     reasons = []
+    # Non-finite prices bypass float comparisons (NaN > x is False) — reject outright.
+    if not math.isfinite(a.price) or a.price <= 0:
+        reasons.append(f"DENY scope: price {a.price} is not a finite positive number")
     reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
     item = reg.get(a.item)
     # 1 authorization
@@ -78,12 +81,14 @@ def main():
         storefront_check = "MATCH" if a.name.split("—")[0].strip()[:24] in html else "no match"
         if storefront_check == "MATCH": reasons.append("DENY duplicate: a product with this name is already live on the storefront")
     # 3 scope
-    if item and abs(item.get("price", -1) - a.price) > 1e-9:
+    if item and not math.isfinite(item.get("price", float("nan"))):
+        reasons.append("DENY scope: registry envelope price is not finite")
+    if item and math.isfinite(a.price) and abs(item.get("price", -1) - a.price) > 1e-9:
         reasons.append(f"DENY scope: price {a.price} != registry envelope {item.get('price')}")
     if not pkg_exists: reasons.append("DENY integrity: package file missing (fail-closed)")
     if not queue_ok: reasons.append("DENY integrity: queue file unreadable (fail-closed)")
     decision = "DENY" if reasons else "ALLOW"
-    entry = {"ts": now, "gate": "gumroad-publish v1.2", "item": a.item, "product": a.name,
+    entry = {"ts": now, "gate": "gumroad-publish v1.2.1", "item": a.item, "product": a.name,
              "price": a.price, "package_sha256": pkg_hash, "storefront_check": storefront_check,
              "decision": decision, "reasons": reasons or ["all checks passed"]}
     h = audit(entry)
