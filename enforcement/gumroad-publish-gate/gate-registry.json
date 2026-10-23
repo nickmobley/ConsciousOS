@@ -1,0 +1,6 @@
+{
+  "CI-01(a)": {"authorized": true, "price": 24, "queue_complete_marker": "CI-01(a) — COMPLETE",
+    "note": "Published 2026-10-23. Any further publish attempt for this item must DENY as duplicate."},
+  "TEST-LEGIT-01": {"authorized": true, "price": 19, "queue_complete_marker": "TEST-LEGIT-01 — COMPLETE",
+    "note": "Synthetic control item for gate testing only. Exists to prove ordinary approved work passes the gate (dry-run; no product is published from this item)."}
+}
