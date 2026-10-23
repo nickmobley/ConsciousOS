@@ -12,7 +12,7 @@ BEFORE any write. The gate checks, in order:
   4. AUDIT: every decision (ALLOW or DENY) is appended to a hash-chained JSONL audit log
      BEFORE the result is returned. A DENY stops the workflow before any external write.
 On ALLOW the gate issues a permit file (item, product, price, package sha256, expiry 30 min).
-The executor (separate step) must present a valid permit. Gate version 1.0.
+The executor (separate step) must present a valid permit. Gate version 1.2 (fail-closed fixes; see PR).
 Honest limit: permit/audit integrity is tamper-EVIDENT (hash chain), not tamper-proof
 against an actor with full filesystem control; see the architecture doc for the route
 inventory and the remaining bypass analysis.
@@ -37,9 +37,11 @@ def audit(entry):
     with AUDIT.open("a") as f: f.write(json.dumps(entry)+"\n")
     return entry["hash"]
 
+STOREFRONT_URL = __import__("os").environ.get("GUMROAD_STOREFRONT_URL", "https://nickmobley.gumroad.com")
+
 def storefront_names():
     try:
-        req = urllib.request.Request("https://nickmobley.gumroad.com", headers={"User-Agent":"Mozilla/5.0"})
+        req = urllib.request.Request(STOREFRONT_URL, headers={"User-Agent":"Mozilla/5.0"})
         html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8","ignore")
         return html
     except Exception:
@@ -53,7 +55,8 @@ def main():
     a = ap.parse_args()
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     pkg = pathlib.Path(a.package)
-    pkg_hash = hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg.exists() else "MISSING"
+    pkg_exists = pkg.exists()
+    pkg_hash = hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg_exists else "MISSING"
     reasons = []
     reg = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
     item = reg.get(a.item)
@@ -62,20 +65,25 @@ def main():
     if item is None: reasons.append("DENY authz: item not in gate registry (no recorded authorization envelope)")
     elif not item.get("authorized"): reasons.append("DENY authz: registry marks item not authorized")
     # 2a duplicate — queue state
-    q = QUEUE.read_text() if QUEUE.exists() else ""
+    queue_ok = QUEUE.exists()
+    q = QUEUE.read_text() if queue_ok else ""
     if item and item.get("queue_complete_marker") and item["queue_complete_marker"] in q:
         reasons.append("DENY duplicate: queue records this item COMPLETE with a live listing")
     # 2b duplicate — live storefront
     html = storefront_names()
     storefront_check = "UNKNOWN (fetch failed)"
+    if html is None:
+        reasons.append("DENY integrity: storefront check unavailable (fail-closed)")
     if html is not None:
         storefront_check = "MATCH" if a.name.split("—")[0].strip()[:24] in html else "no match"
         if storefront_check == "MATCH": reasons.append("DENY duplicate: a product with this name is already live on the storefront")
     # 3 scope
     if item and abs(item.get("price", -1) - a.price) > 1e-9:
         reasons.append(f"DENY scope: price {a.price} != registry envelope {item.get('price')}")
+    if not pkg_exists: reasons.append("DENY integrity: package file missing (fail-closed)")
+    if not queue_ok: reasons.append("DENY integrity: queue file unreadable (fail-closed)")
     decision = "DENY" if reasons else "ALLOW"
-    entry = {"ts": now, "gate": "gumroad-publish v1.0", "item": a.item, "product": a.name,
+    entry = {"ts": now, "gate": "gumroad-publish v1.2", "item": a.item, "product": a.name,
              "price": a.price, "package_sha256": pkg_hash, "storefront_check": storefront_check,
              "decision": decision, "reasons": reasons or ["all checks passed"]}
     h = audit(entry)
