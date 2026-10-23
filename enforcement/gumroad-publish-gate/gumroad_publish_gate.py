@@ -1,141 +1,162 @@
 #!/usr/bin/env python3
-"""Gumroad publish gate — the policy enforcement point. Gate version 1.2.2.
-Every Gumroad publication attempt in the fleet workflow calls this gate BEFORE any
-write. Checks, in order:
-  1. AUTHORIZATION: the item exists in the gate registry with `authorized` strictly
-     boolean true, and its (normalized) action class is not on the always-stopped list.
-  2. DUPLICATE PROTECTION (two signals): queue state AND a live storefront read
-     (product names are HTML-unescaped before matching). FAIL-CLOSED: if the
-     storefront cannot be read, the queue cannot be read, or the package is missing,
-     the gate DENIES — an unavailable check never becomes an approval.
-  3. SCOPE: the requested price must be a finite positive number and equal the
-     registered envelope. (NaN defeats float comparison and is rejected outright.)
-  4. AUDIT: every decision is appended to a hash-chained JSONL log under an exclusive
-     file lock (concurrent appends cannot fork the chain), BEFORE the result returns.
-On ALLOW the gate issues a 30-minute permit bound to the ALLOW audit entry's fields.
-Any unexpected error is converted into an audited DENY — the gate never crashes
-silently. Storefront URL is a code constant (no environment override).
-Usage: gumroad_publish_gate.py --item X --name "<product>" --price N --package <zip>
+"""Gumroad controlled-route publication policy gate v1.2.3 (DRY-RUN ONLY).
+
+A gate permit is only a local candidate, not owner identity or production
+permission. No external publication occurs here. Independent verifier and
+credential isolation are not yet in force.
 """
-import argparse, fcntl, hashlib, html, json, math, pathlib, sys, time, unicodedata, urllib.request
+import argparse
+import hashlib
+import html
+import json
+import math
+import pathlib
+import sys
+import time
+import urllib.request
+from audit_io import AuditStore, AuditUnavailable
 
-BASE = pathlib.Path.home()/"workspace/operation-mobley/enforcement"
-QUEUE = pathlib.Path.home()/"workspace/operation-mobley/commercial-deliverables-queue.md"
-REGISTRY = BASE/"gate-registry.json"
-AUDIT = BASE/"publish-audit.jsonl"
-LOCK = BASE/"publish-audit.lock"
-PERMITS = BASE/"permits"
-STOREFRONT_URL = "https://nickmobley.gumroad.com"
-STOPPED = {"spend","bid","contract","upwork-submit","job-application","new-channel-publish","credential-create"}
+BASE = pathlib.Path.home() / 'workspace/operation-mobley/enforcement'
+QUEUE = pathlib.Path.home() / 'workspace/operation-mobley/commercial-deliverables-queue.md'
+REGISTRY = BASE / 'gate-registry.json'
+PERMITS = BASE / 'permits'
+STOREFRONT_URL = 'https://nickmobley.gumroad.com'
+AUDIT = AuditStore(BASE)
 
-def norm_class(c):
-    c = unicodedata.normalize("NFKC", str(c)).casefold()
-    c = "".join(ch for ch in c if unicodedata.category(ch) not in ("Cf", "Cc"))
-    return c.replace("_", "-").replace(" ", "-").strip()
 
-def audit(entry):
-    """Append one entry under an exclusive lock so concurrent writers cannot fork
-    the hash chain: read-prev, compute, append — all inside the lock."""
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOCK, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        prev = "GENESIS"
-        if AUDIT.exists():
-            lines = AUDIT.read_text(errors="replace").strip().splitlines()
-            if lines:
-                try:
-                    prev = json.loads(lines[-1])["hash"]
-                except Exception:
-                    prev = "UNPARSEABLE-TAIL"
-                    entry["tail_warning"] = "previous audit line unparseable; chain already broken"
-        entry["prev"] = prev
-        entry["hash"] = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
-        with AUDIT.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-    return entry["hash"]
+def price_of(raw):
+    try:
+        n = float(raw)
+        if not math.isfinite(n) or n <= 0:
+            raise ValueError('not positive finite')
+        return n
+    except (ValueError, TypeError, OverflowError) as e:
+        raise ValueError('price is not a finite positive number') from e
+
 
 def storefront_html():
-    try:
-        req = urllib.request.Request(STOREFRONT_URL, headers={"User-Agent": "Mozilla/5.0"})
-        return urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
-    except Exception:
-        return None
+    req = urllib.request.Request(STOREFRONT_URL, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        if getattr(response, 'status', None) not in (None, 200):
+            raise ValueError('storefront HTTP response not OK')
+        return response.read().decode('utf-8', errors='replace')
 
-def run(a):
-    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def evaluate(a):
     reasons = []
-    if not math.isfinite(a.price) or a.price <= 0:
-        reasons.append(f"DENY scope: price {a.price} is not a finite positive number")
-    if norm_class(a.action_class) in STOPPED:
-        reasons.append(f"DENY authz: action class '{a.action_class}' is on the always-stopped list")
-    pkg = pathlib.Path(a.package)
-    pkg_exists = pkg.exists()
-    pkg_hash = hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg_exists else "MISSING"
-    if not pkg_exists:
-        reasons.append("DENY integrity: package file missing (fail-closed)")
-    reg = {}
-    if REGISTRY.exists():
-        reg = json.loads(REGISTRY.read_text())
-    item = reg.get(a.item)
-    if item is None:
-        reasons.append("DENY authz: item not in gate registry (no recorded authorization envelope)")
-    elif item.get("authorized") is not True:
-        reasons.append("DENY authz: registry does not mark this item authorized (strict boolean true required)")
-    queue_ok = QUEUE.exists()
-    q = QUEUE.read_text(errors="replace") if queue_ok else ""
-    if not queue_ok:
-        reasons.append("DENY integrity: queue file unreadable (fail-closed)")
-    if item and item.get("queue_complete_marker") and item["queue_complete_marker"] in q:
-        reasons.append("DENY duplicate: queue records this item COMPLETE with a live listing")
-    raw = storefront_html()
-    storefront_check = "UNAVAILABLE"
-    if raw is None:
-        reasons.append("DENY integrity: storefront check unavailable (fail-closed)")
-    else:
-        page = html.unescape(raw)
-        needle = a.name.split("—")[0].strip()[:24]
-        storefront_check = "MATCH" if (needle and needle in page) else "no match"
-        if storefront_check == "MATCH":
-            reasons.append("DENY duplicate: a product with this name is already live on the storefront")
-    if item and not math.isfinite(item.get("price", float("nan"))):
-        reasons.append("DENY scope: registry envelope price is not finite")
-    if item and math.isfinite(a.price) and math.isfinite(item.get("price", float("nan"))) \
-            and abs(item["price"] - a.price) > 1e-9:
-        reasons.append(f"DENY scope: price {a.price} != registry envelope {item['price']}")
-    decision = "DENY" if reasons else "ALLOW"
-    entry = {"ts": now, "gate": "gumroad-publish v1.2.2", "item": a.item, "product": a.name,
-             "price": a.price, "package_sha256": pkg_hash, "storefront_check": storefront_check,
-             "decision": decision, "reasons": reasons or ["all checks passed"]}
-    h = audit(entry)
-    if decision == "ALLOW":
-        PERMITS.mkdir(exist_ok=True)
-        permit = {"item": a.item, "product": a.name, "price": a.price, "package_sha256": pkg_hash,
-                  "issued": now, "expires_epoch": time.time() + 1800, "audit_hash": h}
-        (PERMITS/f"{a.item.replace('/','_')}.json").write_text(json.dumps(permit, indent=2))
-    print(json.dumps(entry, indent=2))
-    return 0 if decision == "ALLOW" else 3
+    requested_price = None
+    try:
+        requested_price = price_of(a.price)
+    except ValueError as e:
+        reasons.append('DENY scope: ' + str(e))
+
+    # No denylist or normalizable synonyms: only one action is admitted.
+    # A malicious unknown action cannot gain publication authority.
+    if a.action_class != 'gumroad-publish':
+        reasons.append('DENY authz: action class not explicitly permitted')
+    # Fixture identifiers must never be publishable in the controlled route.
+    if a.item.startswith('TEST-'):
+        reasons.append('DENY authz: test-only item cannot be published')
+
+    pkg_hash = 'MISSING'
+    try:
+        pkg_hash = hashlib.sha256(pathlib.Path(a.package).read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        reasons.append('DENY integrity: package file missing or unreadable')
+
+    item = None
+    try:
+        registry = json.loads(REGISTRY.read_text())
+        if not isinstance(registry, dict):
+            raise ValueError('registry is not a mapping')
+        item = registry.get(a.item)
+        if not isinstance(item, dict) or item.get('authorized') is not True:
+            reasons.append('DENY authz: registry requires strict boolean authorization')
+        else:
+            try:
+                registered_price = price_of(item.get('price'))
+                if requested_price is not None and abs(registered_price - requested_price) > 1e-9:
+                    reasons.append('DENY scope: price differs from registry envelope')
+            except ValueError:
+                reasons.append('DENY scope: registry envelope price is invalid')
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        reasons.append('DENY integrity: registry unavailable or malformed')
+
+    try:
+        queue = QUEUE.read_text()
+        if item and item.get('queue_complete_marker'):
+            if item['queue_complete_marker'] in queue:
+                reasons.append('DENY duplicate: queue records item COMPLETE')
+    except (OSError, UnicodeDecodeError):
+        reasons.append('DENY integrity: queue unavailable')
+
+    storefront_check = 'UNAVAILABLE'
+    try:
+        page = html.unescape(storefront_html())
+        needle = a.name.split('—')[0].strip()[:24]
+        if not needle or needle in page:
+            storefront_check = 'MATCH'
+            reasons.append('DENY duplicate: product already live or invalid name')
+        else:
+            storefront_check = 'NO-MATCH-IN-PAGE (not an authoritative catalog)'
+    except Exception:
+        reasons.append('DENY integrity: storefront check unavailable')
+
+    decision = 'DENY' if reasons else 'ALLOW'
+    event = {
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'gate': 'gumroad-publish v1.2.3',
+        'item': a.item, 'product': a.name, 'price': requested_price,
+        'package_sha256': pkg_hash, 'storefront_check': storefront_check,
+        'decision': decision, 'reasons': reasons or ['all checks passed (dry-run only)'],
+    }
+    saved = AUDIT.append(event)
+    if decision == 'ALLOW':
+        # Permit is only usable by a dry-run validator; no Gumroad write integration.
+        PERMITS.mkdir(parents=True, exist_ok=True)
+        permit = {
+            'item': a.item, 'product': a.name, 'price': requested_price,
+            'package_sha256': pkg_hash, 'issued': event['ts'],
+            'expires_epoch': time.time() + 1800, 'audit_hash': saved['hash'],
+        }
+        # Atomic replacement of a fully-written permit; still NOT key-isolated.
+        tmp = PERMITS / (a.item.replace('/', '_') + '.json.tmp')
+        dest = PERMITS / (a.item.replace('/', '_') + '.json')
+        tmp.write_text(json.dumps(permit, indent=2))
+        tmp.replace(dest)
+    return event
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--item", required=True)
-    ap.add_argument("--name", required=True)
-    ap.add_argument("--price", type=float, required=True)
-    ap.add_argument("--package", required=True)
-    ap.add_argument("--action-class", default="gumroad-publish")
-    a = ap.parse_args()
+    ap.add_argument('--item', required=True)
+    ap.add_argument('--name', required=True)
+    ap.add_argument('--price', required=True)  # string: invalid input remains audit-able
+    ap.add_argument('--package', required=True)
+    ap.add_argument('--action-class', default='gumroad-publish')
+    # argparse mistakes '-inf' for another option unless we bind it to price.
+    argv = sys.argv[1:]
+    for i in range(len(argv) - 1):
+        if argv[i] == '--price' and argv[i + 1].startswith('-') and argv[i + 1] not in ('--item', '--name', '--package', '--action-class', '--price'):
+            argv[i] = '--price=' + argv.pop(i + 1)
+            break
+    a = ap.parse_args(argv)
     try:
-        sys.exit(run(a))
-    except SystemExit:
-        raise
-    except Exception as e:  # never crash without a trace
+        result = evaluate(a)
+        print(json.dumps(result, indent=2))
+        return 0 if result['decision'] == 'ALLOW' else 3
+    except Exception as exc:
         try:
-            audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "gate": "gumroad-publish v1.2.2",
-                   "item": a.item, "product": a.name, "decision": "DENY",
-                   "reasons": [f"gate error converted to audited DENY: {type(e).__name__}: {e}"]})
-        except Exception:
-            pass
-        print(json.dumps({"decision": "DENY", "error": type(e).__name__}))
-        sys.exit(3)
+            AUDIT.append({
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                'gate': 'gumroad-publish v1.2.3', 'item': a.item,
+                'product': a.name, 'decision': 'DENY',
+                'reasons': ['DENY internal error: ' + type(exc).__name__],
+            })
+        except Exception as audit_exc:
+            AUDIT.incident('gate', a.item, audit_exc)
+        print(json.dumps({'decision': 'DENY', 'reason': 'gate failure; no permit'}))
+        return 3
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    sys.exit(main())
