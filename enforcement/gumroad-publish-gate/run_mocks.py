@@ -77,24 +77,19 @@ rc, out = run(EXE, EXE_ARGS)
 check("M5 tampered chain -> DENY", rc == 3 and any("chain verification failed" in r for r in out["reasons"]), str(out["reasons"]))
 
 
-# ---- M7 non-finite price cases (appended v1.2.1) ----
-def m7():
-    out = []
-    build_home()
-    rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","nan","--package",str(PKG)])
-    out.append(("M7a gate NaN price -> DENY", rc == 3 and any("not a finite" in r for r in o["reasons"])))
-    rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","inf","--package",str(PKG)])
-    out.append(("M7b gate inf price -> DENY", rc == 3))
-    rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","-5","--package",str(PKG)])
-    out.append(("M7c gate negative price -> DENY", rc == 3))
-    build_home()
-    rc, o = run(GATE, LEGIT)  # valid permit
-    rc, o = run(EXE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","nan","--package",str(PKG)])
-    out.append(("M7d executor NaN price -> DENY", rc == 3 and any("not a finite" in r for r in o["reasons"])))
-    for name, ok in out: print(("PASS " if ok else "FAIL ") + name)
-    return all(ok for _, ok in out)
-print("== M7:", "ALL PASS" if m7() else "FAILURES PRESENT")
+# ---- M7 non-finite price cases (v1.2.1) — results feed the SAME results list ----
+build_home()
+rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","nan","--package",str(PKG)])
+check("M7a gate NaN price -> DENY", rc == 3 and any("not a finite" in r for r in o["reasons"]), str(o.get("reasons")))
+rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","inf","--package",str(PKG)])
+check("M7b gate inf price -> DENY", rc == 3, str(o.get("reasons")))
+rc, o = run(GATE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","-5","--package",str(PKG)])
+check("M7c gate negative price -> DENY", rc == 3, str(o.get("reasons")))
+build_home()
+rc, o = run(GATE, LEGIT)  # valid permit for the executor NaN case
+rc, o = run(EXE, ["--item","TEST-LEGIT-01","--name","Synthetic Control Product ZZ","--price","nan","--package",str(PKG)])
+check("M7d executor NaN price -> DENY", rc == 3 and any("not a finite" in r for r in o["reasons"]), str(o.get("reasons")))
 
-ok_main = all(ok for _, ok, _ in results)
-print("\n== FINAL SUMMARY: main", sum(1 for _, ok, _ in results if ok), "/", len(results), "+ M7 block above")
-sys.exit(0 if (ok_main and "ALL PASS" in open("/dev/null").read() or ok_main) else 1)
+passed = sum(1 for _, ok, _ in results if ok)
+print(f"\n== FINAL SUMMARY: {passed} / {len(results)} passed")
+sys.exit(0 if passed == len(results) else 1)
