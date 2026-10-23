@@ -1,178 +1,180 @@
 #!/usr/bin/env python3
-"""Executor-side permit validation (gate v1.2.2) — the controlled tool's front door.
-Before ANY publish write, the executor must present a gate permit. This validator:
-  - loads the permit and matches item/product/price/package sha256 against the
-    execution request (tamper check);
-  - BINDS the permit to its audit entry: the entry named by the permit's audit hash
-    must exist, be an ALLOW, and carry identical item/product/price/package fields
-    (a permit reusing a DENIED entry's hash, or issued for another item, is rejected);
-  - verifies the FULL audit hash chain (recomputed, not membership-only); any
-    unparseable line fails verification closed;
-  - enforces the 30-minute expiry and SINGLE USE (atomic O_EXCL consumption claim);
-  - audits its own decision either way. ANY unexpected error (missing package,
-    truncated log, non-numeric permit price) becomes an audited DENY — the executor
-    never crashes without a trace.
-Execution remains a DRY RUN in v1.2.2 (no platform write) — the validator is the
-mechanical boundary; the write channel plugs in behind it after owner decisions.
-Usage: gumroad_executor_check.py --item X --name "<name>" --price N --package <zip>
+"""Controlled-route executor validation v1.2.3: DRY RUN, no platform write.
+
+Rejects unbound, expired, malformed and previously consumed permits; enforces
+append-only audit validation and best-effort incident record on corruption.
 """
-import argparse, fcntl, hashlib, json, math, os, pathlib, sys, time
+import argparse
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import sys
+import time
+from audit_io import AuditStore, AuditUnavailable
 
-BASE = pathlib.Path.home()/"workspace/operation-mobley/enforcement"
-AUDIT = BASE/"publish-audit.jsonl"
-LOCK = BASE/"publish-audit.lock"
-PERMITS = BASE/"permits"
-CONSUMED = BASE/"consumed-permits.jsonl"
+BASE = pathlib.Path.home() / 'workspace/operation-mobley/enforcement'
+PERMITS = BASE / 'permits'
+CONSUMED = BASE / 'consumed-permits.jsonl'
+AUDIT = AuditStore(BASE)
 
-def audit(entry):
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOCK, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        prev = "GENESIS"
-        if AUDIT.exists():
-            lines = AUDIT.read_text(errors="replace").strip().splitlines()
-            if lines:
-                try:
-                    prev = json.loads(lines[-1])["hash"]
-                except Exception:
-                    prev = "UNPARSEABLE-TAIL"
-                    entry["tail_warning"] = "previous audit line unparseable; chain already broken"
-        entry["prev"] = prev
-        entry["hash"] = hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()
-        with AUDIT.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-    return entry["hash"]
 
-def load_audit():
-    """Return (entries, ok). ok=False if any line is unparseable — fail closed."""
-    entries = []
-    if not AUDIT.exists():
-        return entries, True
-    with open(LOCK, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_SH)
-        text = AUDIT.read_text(errors="replace")
-    for line in text.strip().splitlines():
-        if not line.strip():
-            continue
-        try:
-            entries.append(json.loads(line))
-        except Exception:
-            return entries, False
-    return entries, True
+def price_of(raw):
+    try:
+        n = float(raw)
+        if not math.isfinite(n) or n <= 0:
+            raise ValueError('not positive finite')
+        return n
+    except (ValueError, TypeError, OverflowError) as e:
+        raise ValueError('price is not a finite positive number') from e
 
-def verify_chain(entries):
-    prev = "GENESIS"
-    for e in entries:
-        if e.get("prev") != prev:
-            return False
-        h = e["hash"]
-        e2 = dict(e)
-        del e2["hash"]
-        if hashlib.sha256(json.dumps(e2, sort_keys=True).encode()).hexdigest() != h:
-            return False
-        prev = h
-    return True
+
+def audit_deny(item, product, reasons):
+    event = {
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'gate': 'executor-check v1.2.3',
+        'item': item, 'product': product, 'decision': 'DENY', 'reasons': reasons,
+    }
+    try:
+        AUDIT.append(event)
+    except Exception as e:
+        AUDIT.incident('executor', item, e)
+    return event
+
 
 def try_consume(permit_hash, item, now):
-    """Atomically claim the permit: exactly one concurrent caller can create the
-    per-permit lock file; everyone else gets False."""
-    lock = BASE/f"consumed-{permit_hash}.lock"
+    if not re.fullmatch(r'[0-9a-f]{64}', permit_hash):
+        raise ValueError('invalid permit hash')
+    claim = BASE / ('consumed-' + permit_hash + '.lock')
+    fd = None
     try:
-        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(str(claim), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         return False
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps({"audit_hash": permit_hash, "item": item, "consumed_at": now}))
-    with CONSUMED.open("a") as f:
-        f.write(json.dumps({"audit_hash": permit_hash, "item": item, "consumed_at": now}) + "\n")
+    with os.fdopen(fd, 'w') as f:
+        f.write(json.dumps({'audit_hash': permit_hash, 'item': item, 'consumed_at': now}))
+        f.flush()
+        os.fsync(f.fileno())
+    with open(CONSUMED, 'a') as f:
+        f.write(json.dumps({'audit_hash': permit_hash, 'item': item, 'consumed_at': now}) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
     return True
 
-def run(a):
-    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def validate(a):
     reasons = []
-    if not math.isfinite(a.price) or a.price <= 0:
-        reasons.append(f"DENY permit: requested price {a.price} is not a finite positive number")
+    try:
+        requested_price = price_of(a.price)
+    except ValueError as e:
+        requested_price = None
+        reasons.append('DENY permit: ' + str(e))
+    if a.item.startswith('TEST-'):
+        reasons.append('DENY permit: test-only item cannot execute')
     permit = None
-    pf = PERMITS/f"{a.item.replace('/','_')}.json"
-    if not pf.exists():
-        reasons.append("DENY permit: none issued for this item")
-    else:
-        permit = json.loads(pf.read_text())
-    entries, audit_ok = load_audit()
-    if not audit_ok:
-        reasons.append("DENY permit: audit log contains an unparseable line (fail-closed)")
-    elif not verify_chain(entries):
-        reasons.append("DENY permit: audit chain verification failed (tamper or corruption)")
+    try:
+        permit = json.loads((PERMITS / (a.item.replace('/', '_') + '.json')).read_text())
+        if not isinstance(permit, dict):
+            raise ValueError('permit not object')
+    except (OSError, ValueError, TypeError):
+        reasons.append('DENY permit: permit missing or malformed')
+
+    try:
+        entries = AUDIT.read_verified()
+    except AuditUnavailable as e:
+        # Do not rewrite a damaged primary audit log. Fail closed, separate journal.
+        AUDIT.incident('executor-audit-corruption', a.item, e)
+        return {'decision': 'DENY', 'reasons': ['DENY integrity: primary audit unavailable or corrupt'], 'audit_integrity': 'UNVERIFIED'}, 3
+
     if permit is not None:
-        pkg_hash = hashlib.sha256(pathlib.Path(a.package).read_bytes()).hexdigest()
-        if permit.get("product") != a.name:
-            reasons.append("DENY permit: product mismatch (tamper or wrong permit)")
-        p_price = permit.get("price")
-        if not isinstance(p_price, (int, float)) or isinstance(p_price, bool) or not math.isfinite(p_price):
-            reasons.append("DENY permit: permit price is not a finite number")
-        elif math.isfinite(a.price) and abs(p_price - a.price) > 1e-9:
-            reasons.append("DENY permit: price mismatch vs permit envelope")
-        if permit.get("package_sha256") != pkg_hash:
-            reasons.append("DENY permit: package hash mismatch")
-        if isinstance(permit.get("expires_epoch"), (int, float)) and time.time() > permit["expires_epoch"]:
-            reasons.append("DENY permit: expired")
-        # Binding: the permit must name an ALLOW audit entry with identical fields.
-        bound = next((e for e in entries if e.get("hash") == permit.get("audit_hash")), None)
+        try:
+            pkg_hash = hashlib.sha256(pathlib.Path(a.package).read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            pkg_hash = None
+            reasons.append('DENY permit: package missing or unreadable')
+        try:
+            permit_price = price_of(permit.get('price'))
+        except ValueError:
+            permit_price = None
+            reasons.append('DENY permit: permit price is not a finite positive number')
+        if permit.get('item') != a.item:
+            reasons.append('DENY permit: item mismatch')
+        if permit.get('product') != a.name:
+            reasons.append('DENY permit: product mismatch')
+        if requested_price is not None and permit_price is not None and abs(requested_price - permit_price) > 1e-9:
+            reasons.append('DENY permit: price mismatch')
+        if pkg_hash != permit.get('package_sha256'):
+            reasons.append('DENY permit: package hash mismatch')
+        expiry = permit.get('expires_epoch')
+        if not isinstance(expiry, (int, float)) or isinstance(expiry, bool) or not math.isfinite(expiry) or time.time() > expiry:
+            reasons.append('DENY permit: expired or invalid expiry')
+        bound = next((e for e in entries if e.get('hash') == permit.get('audit_hash')), None)
         if bound is None:
-            reasons.append("DENY permit: audit hash not found in audit log")
+            reasons.append('DENY permit: matching audit entry missing')
         else:
-            if bound.get("decision") != "ALLOW":
-                reasons.append("DENY permit: bound audit entry is not an ALLOW")
-            if bound.get("item") != permit.get("item") or bound.get("item") != a.item:
-                reasons.append("DENY permit: item mismatch vs bound audit entry")
-            if bound.get("product") != permit.get("product"):
-                reasons.append("DENY permit: product mismatch vs bound audit entry")
-            if bound.get("price") != permit.get("price"):
-                reasons.append("DENY permit: price mismatch vs bound audit entry")
-            if bound.get("package_sha256") != permit.get("package_sha256"):
-                reasons.append("DENY permit: package mismatch vs bound audit entry")
-        consumed = set()
+            if bound.get('decision') != 'ALLOW':
+                reasons.append('DENY permit: bound audit entry is not ALLOW')
+            for field, expected in [('item', a.item), ('product', a.name), ('package_sha256', pkg_hash)]:
+                if bound.get(field) != expected or permit.get(field) != expected:
+                    reasons.append('DENY permit: bound audit ' + field + ' mismatch')
+            if requested_price is None or not isinstance(bound.get('price'), (int,float)) or isinstance(bound.get('price'),bool) or not math.isfinite(bound['price']) or abs(bound['price']-requested_price)>1e-9:
+                reasons.append('DENY permit: bound audit price mismatch')
         if CONSUMED.exists():
-            for line in CONSUMED.read_text(errors="replace").strip().splitlines():
-                try:
-                    consumed.add(json.loads(line)["audit_hash"])
-                except Exception:
-                    pass
-        if permit.get("audit_hash") in consumed:
-            reasons.append("DENY permit: already consumed (replay)")
-    decision = "DENY" if reasons else "ACCEPT"
-    entry = {"ts": now, "gate": "executor-check v1.2.2", "item": a.item, "product": a.name,
-             "decision": decision,
-             "reasons": reasons or ["permit valid; consumed atomically; dry-run boundary passed (no platform write)"]}
-    if decision == "ACCEPT":
-        if not try_consume(permit["audit_hash"], a.item, now):
-            decision = "DENY"
-            entry["decision"] = "DENY"
-            entry["reasons"] = ["DENY permit: consumption race lost — another executor claimed this permit first"]
-    audit(entry)
-    print(json.dumps(entry, indent=2))
-    return 0 if decision == "ACCEPT" else 3
+            try:
+                for line in CONSUMED.read_text().splitlines():
+                    if json.loads(line).get('audit_hash') == permit.get('audit_hash'):
+                        reasons.append('DENY permit: already consumed (replay)')
+                        break
+            except (OSError, ValueError):
+                reasons.append('DENY integrity: consumed registry unreadable')
+
+    if reasons:
+        result = audit_deny(a.item, a.name, reasons)
+        return result, 3
+    now = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+    try:
+        success = try_consume(permit['audit_hash'], a.item, now)
+    except Exception as exc:
+        result = audit_deny(a.item, a.name, ['DENY permit: consumption failed: ' + type(exc).__name__])
+        return result, 3
+    if not success:
+        result = audit_deny(a.item, a.name, ['DENY permit: already consumed (replay)'])
+        return result, 3
+    entry = {
+        'ts': now, 'gate': 'executor-check v1.2.3', 'item': a.item,
+        'product': a.name, 'decision': 'ACCEPT',
+        'reasons': ['DRY RUN only; no platform write'],
+    }
+    try:
+        AUDIT.append(entry)
+    except Exception as exc:
+        AUDIT.incident('executor-postconsume', a.item, exc)
+        return {'decision': 'DENY', 'reasons': ['DENY integrity: accept audit failed'], 'audit_integrity': 'UNVERIFIED'}, 3
+    return entry, 0
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--item", required=True)
-    ap.add_argument("--name", required=True)
-    ap.add_argument("--price", type=float, required=True)
-    ap.add_argument("--package", required=True)
-    a = ap.parse_args()
+    ap.add_argument('--item', required=True)
+    ap.add_argument('--name', required=True)
+    ap.add_argument('--price', required=True)  # deliberate: parse within audited execution
+    ap.add_argument('--package', required=True)
+    # argparse mistakes '-inf' for another option unless we bind it to price.
+    argv = sys.argv[1:]
+    for i in range(len(argv) - 1):
+        if argv[i] == '--price' and argv[i + 1].startswith('-') and argv[i + 1] not in ('--item', '--name', '--package', '--action-class', '--price'):
+            argv[i] = '--price=' + argv.pop(i + 1)
+            break
+    a = ap.parse_args(argv)
     try:
-        sys.exit(run(a))
-    except SystemExit:
-        raise
-    except Exception as e:  # missing package, bad permit JSON, anything: audited DENY
-        try:
-            audit({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "gate": "executor-check v1.2.2",
-                   "item": a.item, "product": a.name, "decision": "DENY",
-                   "reasons": [f"executor error converted to audited DENY: {type(e).__name__}: {e}"]})
-        except Exception:
-            pass
-        print(json.dumps({"decision": "DENY", "error": type(e).__name__}))
-        sys.exit(3)
+        result, code = validate(a)
+    except Exception as exc:
+        result = audit_deny(a.item, a.name, ['DENY internal error: ' + type(exc).__name__])
+        code = 3
+    print(json.dumps(result, indent=2))
+    return code
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    sys.exit(main())
